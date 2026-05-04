@@ -6,11 +6,13 @@
 #include "ray.h"
 #include "sphere.h"
 #include "hitable_list.h"
+#include "bvh.h"
 #include "camera.h"
 #include "material.h"
 
 // limited version of checkCudaErrors from helper_cuda.h in CUDA examples
 #define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__ )
+constexpr int kMaxDepth = 50;
 
 void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line) {
     if (result) {
@@ -29,7 +31,7 @@ void check_cuda(cudaError_t result, char const *const func, const char *const fi
 __device__ vec3 color(const ray& r, hitable **world, curandState *local_rand_state) {
     ray cur_ray = r;
     vec3 cur_attenuation = vec3(1.0,1.0,1.0);
-    for(int i = 0; i < 50; i++) {
+    for(int i = 0; i < kMaxDepth; i++) {
         hit_record rec;
         if ((*world)->hit(cur_ray, 0.001f, FLT_MAX, rec)) {
             ray scattered;
@@ -120,7 +122,8 @@ __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_cam
         d_list[i++] = new sphere(vec3(-4, 1, 0), 1.0, new lambertian(vec3(0.4, 0.2, 0.1)));
         d_list[i++] = new sphere(vec3(4, 1, 0),  1.0, new metal(vec3(0.7, 0.6, 0.5), 0.0));
         *rand_state = local_rand_state;
-        *d_world  = new hitable_list(d_list, 22*22+1+3);
+        *d_world  = new bvh_node(d_list, 22*22+1+3, &local_rand_state);
+        // new hitable_list(d_list, 22*22+1+3);
 
         vec3 lookfrom(13,2,3);
         vec3 lookat(0,0,0);
@@ -146,11 +149,11 @@ __global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camer
 }
 
 int main() {
-    int nx = 1200;
-    int ny = 800;
-    int ns = 10;
-    int tx = 8;
-    int ty = 8;
+    int nx = 1920;
+    int ny = 1080;
+    int ns = 50;
+    int tx = 16;
+    int ty = 16;
 
     std::cerr << "Rendering a " << nx << "x" << ny << " image with " << ns << " samples per pixel ";
     std::cerr << "in " << tx << "x" << ty << " blocks.\n";
@@ -172,6 +175,9 @@ int main() {
     rand_init<<<1,1>>>(d_rand_state2);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
+
+    checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 32768));
+    checkCudaErrors(cudaDeviceSetLimit(cudaLimitMallocHeapSize, 256*1024*1024));
 
     // make our world of hitables & the camera
     hitable **d_list;
