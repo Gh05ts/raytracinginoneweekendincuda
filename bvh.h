@@ -26,6 +26,55 @@ __device__ void sort_hitable_by_axis(hitable **l, int start, int end, int axis) 
     }
 }
 
+__device__ inline float aabb_surface_area(const aabb &box) {
+    vec3 d = box.max() - box.min();
+    return 2.0f * (d.x() * d.y() + d.x() * d.z() + d.y() * d.z());
+}
+
+__device__ inline bool build_range_box(hitable **l, int start, int end, aabb &out_box) {
+    if (end <= start) return false;
+    aabb temp;
+    if (!l[start]->bounding_box(0.0f, 1.0f, out_box)) return false;
+    for (int i = start + 1; i < end; i++) {
+        if (!l[i]->bounding_box(0.0f, 1.0f, temp)) return false;
+        out_box = surrounding_box(out_box, temp);
+    }
+    return true;
+}
+
+__device__ int choose_sah_split(hitable **l, int start, int end) {
+    int object_span = end - start;
+    if (object_span <= 2) return start + 1;
+
+    float best_cost = 1e30f;
+    int best_axis = 0;
+    int best_mid = choose_sah_split(l, start, end); 
+    // start + object_span / 2;
+
+    for (int axis = 0; axis < 3; axis++) {
+        sort_hitable_by_axis(l, start, end, axis);
+        for (int mid = start + 1; mid <= end - 1; mid++) {
+            aabb left_box, right_box;
+            if (!build_range_box(l, start, mid, left_box) || !build_range_box(l, mid, end, right_box)) {
+                continue;
+            }
+            float left_area = aabb_surface_area(left_box);
+            float right_area = aabb_surface_area(right_box);
+            int left_count = mid - start;
+            int right_count = end - mid;
+            float cost = left_area * left_count + right_area * right_count;
+            if (cost < best_cost) {
+                best_cost = cost;
+                best_axis = axis;
+                best_mid = mid;
+            }
+        }
+    }
+
+    sort_hitable_by_axis(l, start, end, best_axis);
+    return best_mid;
+}
+
 class bvh_node : public hitable {
 public:
     __device__ bvh_node() : left_node(NULL), right_node(NULL), left_obj(NULL), right_obj(NULL), is_leaf(false) {}

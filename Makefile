@@ -13,10 +13,24 @@ else
 endif
 
 # NVCC flags
-NVCCFLAGS = $(NVCC_DBG) -m64
+NVCCFLAGS = $(NVCC_DBG) -m64 -std=c++14
 
 # GPU architecture (sm_75 for Turing / RTX 20xx)
 GENCODE_FLAGS = -gencode arch=compute_75,code=sm_75
+
+ifeq ($(USE_SFML),1)
+    PKG_CONFIG := $(shell command -v pkg-config 2>/dev/null)
+    ifeq ($(PKG_CONFIG),)
+        $(error USE_SFML=1 requires pkg-config. Install pkg-config and SFML dev packages first)
+    endif
+    SFML_EXISTS := $(shell pkg-config --exists sfml-graphics && echo yes || echo no)
+    ifneq ($(SFML_EXISTS),yes)
+        $(error SFML headers/libs not found. Install libsfml-dev (Ubuntu/Debian) or sfml (Homebrew))
+    endif
+    SFML_CFLAGS := $(shell pkg-config --cflags sfml-graphics)
+    SFML_LIBS   := $(shell pkg-config --libs sfml-graphics)
+    NVCCFLAGS   += -DUSE_SFML $(SFML_CFLAGS)
+endif
 
 # Sources
 SRCS = main.cu
@@ -26,7 +40,7 @@ INCS = vec3.h ray.h hitable.h hitable_list.h sphere.h camera.h material.h
 all: cudart
 
 cudart: cudart.o
-	$(NVCC) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ $^
+	$(NVCC) $(NVCCFLAGS) $(GENCODE_FLAGS) -o $@ $^ $(SFML_LIBS)
 
 cudart.o: $(SRCS) $(INCS)
 	$(NVCC) $(NVCCFLAGS) $(GENCODE_FLAGS) -c main.cu -o $@
