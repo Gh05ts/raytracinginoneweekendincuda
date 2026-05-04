@@ -2,10 +2,6 @@
 #include <time.h>
 #include <float.h>
 #include <curand_kernel.h>
-#ifdef USE_SFML
-#include <SFML/Graphics.hpp>
-#include <vector>
-#endif
 #include "vec3.h"
 #include "ray.h"
 #include "sphere.h"
@@ -212,42 +208,11 @@ int main() {
     render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
-    #ifdef USE_SFML
-    sf::RenderWindow window(sf::VideoMode(nx, ny), "CUDA Ray Tracing Preview");
-    sf::Texture texture;
-    texture.create(nx, ny);
-    sf::Sprite sprite(texture);
-    std::vector<sf::Uint8> pixels(nx * ny * 4);
-    for (int cur_samples = 1; cur_samples <= ns && window.isOpen(); cur_samples++) {
-        sf::Event event;
-        while (window.pollEvent(event)) {
-            if (event.type == sf::Event::Closed) window.close();
-        }
-
-        render<<<blocks, threads>>>(fb, nx, ny, cur_samples, d_camera, d_world, d_rand_state);
-        checkCudaErrors(cudaGetLastError());
-        checkCudaErrors(cudaDeviceSynchronize());
-
-        for (int j = 0; j < ny; j++) {
-            for (int i = 0; i < nx; i++) {
-                size_t pixel_index = j * nx + i;
-                int out_idx = 4 * ((ny - 1 - j) * nx + i);
-                pixels[out_idx + 0] = (sf::Uint8)(255.99f * fb[pixel_index].r());
-                pixels[out_idx + 1] = (sf::Uint8)(255.99f * fb[pixel_index].g());
-                pixels[out_idx + 2] = (sf::Uint8)(255.99f * fb[pixel_index].b());
-                pixels[out_idx + 3] = 255;
-            }
-        }
-        texture.update(pixels.data());
-        window.clear();
-        window.draw(sprite);
-        window.display();
-    }
-    #else    
+  
     render<<<blocks, threads>>>(fb, nx, ny,  ns, d_camera, d_world, d_rand_state);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
-    #endif
+
     stop = clock();
     double timer_seconds = ((double)(stop - start)) / CLOCKS_PER_SEC;
     std::cerr << "took " << timer_seconds << " seconds.\n";

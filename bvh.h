@@ -83,8 +83,8 @@ public:
 
     __device__ bvh_node(hitable **l, int start, int end, curandState *local_rand_state)
         : left_node(NULL), right_node(NULL), left_obj(NULL), right_obj(NULL), is_leaf(false) {
-        int axis = int(3 * curand_uniform(local_rand_state));
-        sort_hitable_by_axis(l, start, end, axis);
+        // int axis = int(3 * curand_uniform(local_rand_state));
+        // sort_hitable_by_axis(l, start, end, axis);
 
         int object_span = end - start;
         if (object_span <= 2) {
