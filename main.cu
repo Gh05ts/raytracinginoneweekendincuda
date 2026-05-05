@@ -181,7 +181,8 @@ __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_cam
         int object_count = i;
 
         *rand_state = local_rand_state;
-        *d_world  = new bvh_node(d_list, object_count, &local_rand_state);
+        bool use_sah_for_world = (tri_count == 0);
+        *d_world  = new bvh_node(d_list, object_count, &local_rand_state, use_sah_for_world);
         // new hitable_list(d_list, 22*22+1+3);
 
         vec3 lookfrom(13,2,3);

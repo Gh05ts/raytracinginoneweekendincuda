@@ -77,12 +77,13 @@ __device__ int choose_sah_split(hitable **l, int start, int end) {
 
 class bvh_node : public hitable {
 public:
-    __device__ bvh_node() : left_node(NULL), right_node(NULL), left_obj(NULL), right_obj(NULL), is_leaf(false) {}
-    __device__ bvh_node(hitable **l, int n, curandState *local_rand_state)
-        : bvh_node(l, 0, n, local_rand_state) {}
+    bool use_sah_split;
+    __device__ bvh_node(): left_node(NULL), right_node(NULL), left_obj(NULL), right_obj(NULL), is_leaf(false), use_sah_split(true) {}
+    __device__ bvh_node(hitable **l, int n, curandState *local_rand_state, bool use_sah): bvh_node(l, 0, n, local_rand_state, use_sah) {}
+    __device__ bvh_node(hitable **l, int start, int end, curandState *local_rand_state) : bvh_node(l, start, end, local_rand_state, true) {}
 
-    __device__ bvh_node(hitable **l, int start, int end, curandState *local_rand_state)
-        : left_node(NULL), right_node(NULL), left_obj(NULL), right_obj(NULL), is_leaf(false) {
+    __device__ bvh_node(hitable **l, int start, int end, curandState *local_rand_state, bool use_sah)
+        : left_node(NULL), right_node(NULL), left_obj(NULL), right_obj(NULL), is_leaf(false), use_sah_split(use_sah) {
         int axis = int(3 * curand_uniform(local_rand_state));
         sort_hitable_by_axis(l, start, end, axis);
 
@@ -93,8 +94,17 @@ public:
             right_obj = (object_span == 2) ? l[start + 1] : l[start];
         } else {
             int mid = start + object_span / 2;
-            left_node = new bvh_node(l, start, mid, local_rand_state);
-            right_node = new bvh_node(l, mid, end, local_rand_state);
+            if (use_sah_split) {
+                mid = choose_sah_split(l, start, end);
+            } else {
+                aabb node_box;
+                build_range_box(l, start, end, node_box);
+                vec3 ext = node_box.max() - node_box.min();
+                int axis = (ext.x() > ext.y() && ext.x() > ext.z()) ? 0 : ((ext.y() > ext.z()) ? 1 : 2);
+                sort_hitable_by_axis(l, start, end, axis);
+            }
+            left_node = new bvh_node(l, start, mid, local_rand_state, use_sah_split);
+            right_node = new bvh_node(l, mid, end, local_rand_state, use_sah_split);
         }
 
         aabb box_left;
