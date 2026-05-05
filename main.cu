@@ -1,16 +1,19 @@
 #include <iostream>
 #include <time.h>
 #include <float.h>
+#include <vector>
+#include <fstream>
+#include <sstream>
 #include <curand_kernel.h>
 #include "vec3.h"
 #include "ray.h"
 #include "sphere.h"
+#include "lucy_instance.h"
 #include "hitable_list.h"
 #include "bvh.h"
 #include "camera.h"
 #include "material.h"
 
-// limited version of checkCudaErrors from helper_cuda.h in CUDA examples
 #define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__ )
 constexpr int kMaxDepth = 50;
 
@@ -24,10 +27,6 @@ void check_cuda(cudaError_t result, char const *const func, const char *const fi
     }
 }
 
-// Matching the C++ code would recurse enough into color() calls that
-// it was blowing up the stack, so we have to turn this into a
-// limited-depth loop instead.  Later code in the book limits to a max
-// depth of 50, so we adapt this a few chapters early on the GPU.
 __device__ vec3 color(const ray& r, hitable **world, curandState *local_rand_state) {
     ray cur_ray = r;
     vec3 cur_attenuation = vec3(1.0,1.0,1.0);
@@ -39,14 +38,14 @@ __device__ vec3 color(const ray& r, hitable **world, curandState *local_rand_sta
             if(rec.mat_ptr->scatter(cur_ray, rec, attenuation, scattered, local_rand_state)) {
                 cur_attenuation *= attenuation;
                 // Russian roulette termination after a few guaranteed bounces.
-                // if (i > 3) {
-                //     float survive_probability = fmaxf(cur_attenuation.x(), fmaxf(cur_attenuation.y(), cur_attenuation.z()));
-                //     survive_probability = fminf(fmaxf(survive_probability, 0.05f), 0.95f);
-                //     if (curand_uniform(local_rand_state) > survive_probability) {
-                //         break;
-                //     }
-                //     cur_attenuation /= survive_probability;
-                // }
+                if (i > 3) {
+                    float survive_probability = fmaxf(cur_attenuation.x(), fmaxf(cur_attenuation.y(), cur_attenuation.z()));
+                    survive_probability = fminf(fmaxf(survive_probability, 0.05f), 0.95f);
+                    if (curand_uniform(local_rand_state) > survive_probability) {
+                        break;
+                    }
+                    cur_attenuation /= survive_probability;
+                }
                 cur_ray = scattered;
             }
             else {
@@ -74,10 +73,6 @@ __global__ void render_init(int max_x, int max_y, curandState *rand_state) {
     int j = threadIdx.y + blockIdx.y * blockDim.y;
     if((i >= max_x) || (j >= max_y)) return;
     int pixel_index = j*max_x + i;
-    // Original: Each thread gets same seed, a different sequence number, no offset
-    // curand_init(1984, pixel_index, 0, &rand_state[pixel_index]);
-    // BUGFIX, see Issue#2: Each thread gets different seed, same sequence for
-    // performance improvement of about 2x!
     curand_init(1984+pixel_index, 0, 0, &rand_state[pixel_index]);
 }
 
@@ -104,53 +99,106 @@ __global__ void render(vec3 *fb, int max_x, int max_y, int ns, camera **cam, hit
 
 #define RND (curand_uniform(&local_rand_state))
 
-__global__ void create_world(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state) {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
+static bool load_obj_triangles(const char *path, std::vector<vec3> &v0, std::vector<vec3> &v1, std::vector<vec3> &v2,
+                               vec3 &bbox_min, vec3 &bbox_max, int triangle_stride) {
+    std::ifstream in(path);
+    if (!in.is_open()) return false;
+    std::vector<vec3> verts;
+    std::string line;
+    int face_idx = 0;
+    while (std::getline(in, line)) {
+        if (line.size() > 2 && line[0] == 'v' && line[1] == ' ') {
+            std::istringstream ss(line.substr(2));
+            float x, y, z; ss >> x >> y >> z;
+            verts.push_back(vec3(x, y, z));
+        } else if (line.size() > 2 && line[0] == 'f' && line[1] == ' ') {
+            if ((face_idx++ % triangle_stride) != 0) continue;
+            std::istringstream ss(line.substr(2));
+            std::string a, b, c;
+            ss >> a >> b >> c;
+            auto idx = [](const std::string &s) {
+                size_t slash = s.find('/');
+                return atoi((slash == std::string::npos ? s : s.substr(0, slash)).c_str()) - 1;
+            };
+            int i0 = idx(a), i1 = idx(b), i2 = idx(c);
+            if (i0 >= 0 && i1 >= 0 && i2 >= 0 && i0 < (int)verts.size() && i1 < (int)verts.size() && i2 < (int)verts.size()) {
+                v0.push_back(verts[i0]); v1.push_back(verts[i1]); v2.push_back(verts[i2]);
+            }
+        }
+    }
+    if (v0.empty()) return false;
+    vec3 mn = v0[0], mx = v0[0];
+    for (size_t i = 0; i < v0.size(); i++) {
+        vec3 pts[3] = {v0[i], v1[i], v2[i]};
+        for (int p = 0; p < 3; p++) {
+            mn[0] = fminf(mn[0], pts[p].x()); mn[1] = fminf(mn[1], pts[p].y()); mn[2] = fminf(mn[2], pts[p].z());
+            mx[0] = fmaxf(mx[0], pts[p].x()); mx[1] = fmaxf(mx[1], pts[p].y()); mx[2] = fmaxf(mx[2], pts[p].z());
+        }
+    }
+    bbox_min = mn;
+    bbox_max = mx;
+    return true;
+}
+
+
+__global__ void create_world(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state,
+                             vec3 *tri_v0, vec3 *tri_v1, vec3 *tri_v2, int tri_count, vec3 lucy_bbox_min, vec3 lucy_bbox_max) {
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
         curandState local_rand_state = *rand_state;
-        d_list[0] = new sphere(vec3(0,-1000.0,-1), 1000,
-                               new lambertian(vec3(0.5, 0.5, 0.5)));
+        d_list[0] = new sphere(vec3(0,-1000.0,-1), 1000, new lambertian(vec3(0.5, 0.5, 0.5)));
         int i = 1;
         for(int a = -11; a < 11; a++) {
             for(int b = -11; b < 11; b++) {
                 float choose_mat = RND;
                 vec3 center(a+RND,0.2,b+RND);
                 if(choose_mat < 0.8f) {
-                    d_list[i++] = new sphere(center, 0.2,
-                                             new lambertian(vec3(RND*RND, RND*RND, RND*RND)));
+                    d_list[i++] = new sphere(center, 0.2, new lambertian(vec3(RND*RND, RND*RND, RND*RND)));
                 }
                 else if(choose_mat < 0.95f) {
-                    d_list[i++] = new sphere(center, 0.2,
-                                             new metal(vec3(0.5f*(1.0f+RND), 0.5f*(1.0f+RND), 0.5f*(1.0f+RND)), 0.5f*RND));
+                    d_list[i++] = new sphere(center, 0.2, new metal(vec3(0.5f*(1.0f+RND), 0.5f*(1.0f+RND), 0.5f*(1.0f+RND)), 0.5f*RND));
                 }
                 else {
                     d_list[i++] = new sphere(center, 0.2, new dielectric(1.5));
                 }
             }
         }
-        d_list[i++] = new sphere(vec3(0, 1,0),  1.0, new dielectric(1.5));
-        d_list[i++] = new sphere(vec3(-4, 1, 0), 1.0, new lambertian(vec3(0.4, 0.2, 0.1)));
-        d_list[i++] = new sphere(vec3(4, 1, 0),  1.0, new metal(vec3(0.7, 0.6, 0.5), 0.0));
+        // d_list[i++] = new sphere(vec3(0, 1,0),  1.0, new dielectric(1.5));
+        // d_list[i++] = new sphere(vec3(-4, 1, 0), 1.0, new lambertian(vec3(0.4, 0.2, 0.1)));
+        // d_list[i++] = new sphere(vec3(4, 1, 0),  1.0, new metal(vec3(0.7, 0.6, 0.5), 0.0));
+
+        if (tri_count > 0) {
+            aabb lucy_box(lucy_bbox_min, lucy_bbox_max);
+            material *lucy_mats[3];
+            lucy_mats[0] = new lambertian(vec3(0.8, 0.3, 0.3));
+            lucy_mats[1] = new metal(vec3(0.8, 0.8, 0.9), 0.05f);
+            lucy_mats[2] = new dielectric(1.5f);
+            vec3 offsets[3] = { vec3(-4.0f, 0.0f, 1.0f), vec3(4.0f, 0.0f, 1.0f), vec3(0.0f, 0.0f, 1.0f) };
+            float scale = 0.0035f;
+            for (int inst = 0; inst < 3; inst++) {
+                d_list[i++] = new lucy_instance(tri_v0, tri_v1, tri_v2, tri_count, lucy_box, offsets[inst], scale, lucy_mats[inst]);
+            }
+        }
+        int object_count = i;
+
         *rand_state = local_rand_state;
-        *d_world  = new bvh_node(d_list, 22*22+1+3, &local_rand_state);
+        *d_world  = new bvh_node(d_list, object_count, &local_rand_state);
         // new hitable_list(d_list, 22*22+1+3);
 
         vec3 lookfrom(13,2,3);
         vec3 lookat(0,0,0);
         float dist_to_focus = 10.0; (lookfrom-lookat).length();
         float aperture = 0.1;
-        *d_camera   = new camera(lookfrom,
-                                 lookat,
-                                 vec3(0,1,0),
-                                 30.0,
-                                 float(nx)/float(ny),
-                                 aperture,
-                                 dist_to_focus);
+        *d_camera   = new camera(lookfrom, lookat, vec3(0,1,0), 30.0, float(nx)/float(ny), aperture, dist_to_focus);
     }
 }
 
-__global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camera) {
-    for(int i=0; i < 22*22+1+3; i++) {
+__global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camera, int num_spheres, int num_total) {
+    for(int i=0; i < num_spheres; i++) {
         delete ((sphere *)d_list[i])->mat_ptr;
+        delete d_list[i];
+    }
+    // del triangles
+    for (int i = num_spheres; i < num_total; i++) {
         delete d_list[i];
     }
     delete *d_world;
@@ -158,9 +206,9 @@ __global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camer
 }
 
 int main() {
-    int nx = 1920;
-    int ny = 1080;
-    int ns = 50;
+    int nx = 800;
+    int ny = 400;
+    int ns = 20;
     int tx = 32;
     int ty = 16;
 
@@ -188,15 +236,36 @@ int main() {
     checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 32768));
     checkCudaErrors(cudaDeviceSetLimit(cudaLimitMallocHeapSize, 256*1024*1024));
 
+    std::vector<vec3> tri_v0, tri_v1, tri_v2;
+    vec3 lucy_bbox_min(0,0,0), lucy_bbox_max(0,0,0);
+    const int lucy_triangle_stride = 1;
+    if (load_obj_triangles("lucy.obj", tri_v0, tri_v1, tri_v2, lucy_bbox_min, lucy_bbox_max, lucy_triangle_stride)) {
+        std::cerr << "Loaded lucy.obj with " << tri_v0.size() << " triangles after stride " << lucy_triangle_stride
+                  << ", instanced via 3 bbox-wrapped nodes.\n";
+    } else {
+        std::cerr << "lucy.obj not found or failed to parse, rendering spheres only.\n";
+    }
+
+    int tri_count = (int)tri_v0.size();
+    vec3 *d_tri_v0 = NULL, *d_tri_v1 = NULL, *d_tri_v2 = NULL;
+    if (tri_count > 0) {
+        checkCudaErrors(cudaMalloc((void **)&d_tri_v0, tri_count * sizeof(vec3)));
+        checkCudaErrors(cudaMalloc((void **)&d_tri_v1, tri_count * sizeof(vec3)));
+        checkCudaErrors(cudaMalloc((void **)&d_tri_v2, tri_count * sizeof(vec3)));
+        checkCudaErrors(cudaMemcpy(d_tri_v0, tri_v0.data(), tri_count * sizeof(vec3), cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMemcpy(d_tri_v1, tri_v1.data(), tri_count * sizeof(vec3), cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMemcpy(d_tri_v2, tri_v2.data(), tri_count * sizeof(vec3), cudaMemcpyHostToDevice));
+    }
+
     // make our world of hitables & the camera
     hitable **d_list;
-    int num_hitables = 22*22+1+3;
+    int num_hitables = 22*22+1 + ((tri_count > 0) ? 3 : 0);
     checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables*sizeof(hitable *)));
     hitable **d_world;
     checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
     camera **d_camera;
     checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-    create_world<<<1,1>>>(d_list, d_world, d_camera, nx, ny, d_rand_state2);
+    create_world<<<1,1>>>(d_list, d_world, d_camera, nx, ny, d_rand_state2, d_tri_v0, d_tri_v1, d_tri_v2, tri_count, lucy_bbox_min, lucy_bbox_max);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
@@ -231,13 +300,16 @@ int main() {
 
     // clean up
     checkCudaErrors(cudaDeviceSynchronize());
-    free_world<<<1,1>>>(d_list,d_world,d_camera);
+    free_world<<<1,1>>>(d_list,d_world,d_camera, 22*22+1, num_hitables);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaFree(d_camera));
     checkCudaErrors(cudaFree(d_world));
     checkCudaErrors(cudaFree(d_list));
     checkCudaErrors(cudaFree(d_rand_state));
     checkCudaErrors(cudaFree(d_rand_state2));
+    if (d_tri_v0) checkCudaErrors(cudaFree(d_tri_v0));
+    if (d_tri_v1) checkCudaErrors(cudaFree(d_tri_v1));
+    if (d_tri_v2) checkCudaErrors(cudaFree(d_tri_v2));
     checkCudaErrors(cudaFree(fb));
 
     cudaDeviceReset();

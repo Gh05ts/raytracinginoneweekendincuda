@@ -13,14 +13,14 @@ else
 endif
 
 # NVCC flags
-NVCCFLAGS = $(NVCC_DBG) -m64 -std=c++14
+NVCCFLAGS = $(NVCC_DBG) -m64 -std=c++14 -O3 --use_fast_math
 
 # GPU architecture (sm_75 for Turing / RTX 20xx)
 GENCODE_FLAGS = -gencode arch=compute_75,code=sm_75
 
 # Sources
 SRCS = main.cu
-INCS = vec3.h ray.h hitable.h hitable_list.h triangle.h sphere.h camera.h material.h
+INCS = vec3.h ray.h hitable.h hitable_list.h lucy_instance.h triangle.h sphere.h camera.h material.h
 
 # Targets
 all: cudart
