@@ -11,6 +11,7 @@
 #include "lucy_instance.h"
 #include "hitable_list.h"
 #include "bvh.h"
+#include "bvh_sphere.h"
 #include "camera.h"
 #include "material.h"
 
@@ -142,7 +143,7 @@ static bool load_obj_triangles(const char *path, std::vector<vec3> &v0, std::vec
 
 
 __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state,
-                             vec3 *tri_v0, vec3 *tri_v1, vec3 *tri_v2, int tri_count, vec3 lucy_bbox_min, vec3 lucy_bbox_max) {
+                             vec3 *tri_v0, vec3 *tri_v1, vec3 *tri_v2, int tri_count, vec3 lucy_bbox_min, vec3 lucy_bbox_max, int scene_lucy) {
         if (threadIdx.x == 0 && blockIdx.x == 0) {
         curandState local_rand_state = *rand_state;
         d_list[0] = new sphere(vec3(0,-1000.0,-1), 1000, new lambertian(vec3(0.5, 0.5, 0.5)));
@@ -151,22 +152,20 @@ __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_cam
             for(int b = -11; b < 11; b++) {
                 float choose_mat = RND;
                 vec3 center(a+RND,0.2,b+RND);
-                if(choose_mat < 0.8f) {
-                    d_list[i++] = new sphere(center, 0.2, new lambertian(vec3(RND*RND, RND*RND, RND*RND)));
-                }
-                else if(choose_mat < 0.95f) {
-                    d_list[i++] = new sphere(center, 0.2, new metal(vec3(0.5f*(1.0f+RND), 0.5f*(1.0f+RND), 0.5f*(1.0f+RND)), 0.5f*RND));
-                }
-                else {
-                    d_list[i++] = new sphere(center, 0.2, new dielectric(1.5));
+                if(choose_mat < 0.7f) {
+                    d_list[i++] = new sphere(center, 0.25, new lambertian(vec3(RND*RND, RND*RND, RND*RND)));
+                } else if(choose_mat < 0.85f) {
+                    d_list[i++] = new sphere(center, 0.3 * choose_mat, new metal(vec3(0.5f*(1.0f+RND), 0.5f*(1.0f+RND), 0.5f*(1.0f+RND)), 0.5f*RND));
+                } else {
+                    d_list[i++] = new sphere(center, 0.25 * choose_mat, new dielectric(1.5));
                 }
             }
         }
-        // d_list[i++] = new sphere(vec3(0, 1,0),  1.0, new dielectric(1.5));
-        // d_list[i++] = new sphere(vec3(-4, 1, 0), 1.0, new lambertian(vec3(0.4, 0.2, 0.1)));
-        // d_list[i++] = new sphere(vec3(4, 1, 0),  1.0, new metal(vec3(0.7, 0.6, 0.5), 0.0));
-
-        if (tri_count > 0) {
+        if (!scene_lucy) {
+            d_list[i++] = new sphere(vec3(0, 1,0),  1.0, new dielectric(1.5));
+            d_list[i++] = new sphere(vec3(-4, 1, 0), 1.0, new lambertian(vec3(0.4, 0.2, 0.1)));
+            d_list[i++] = new sphere(vec3(4, 1, 0),  1.0, new metal(vec3(0.7, 0.6, 0.5), 0.0));
+        } else {
             aabb lucy_box(lucy_bbox_min, lucy_bbox_max);
             material *lucy_mats[3];
             lucy_mats[0] = new lambertian(vec3(0.8, 0.3, 0.3));
@@ -181,8 +180,12 @@ __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_cam
         int object_count = i;
 
         *rand_state = local_rand_state;
-        bool use_sah_for_world = (tri_count == 0);
-        *d_world  = new bvh_node(d_list, object_count, &local_rand_state, use_sah_for_world);
+        // *d_world  = new bvh_node(d_list, object_count, &local_rand_state);
+        if (scene_lucy) {
+            *d_world = new bvh_node(d_list, object_count, &local_rand_state);
+        } else {
+            *d_world = new bvh_sphere_node(d_list, object_count, &local_rand_state);
+        }
         // new hitable_list(d_list, 22*22+1+3);
 
         vec3 lookfrom(13,2,3);
@@ -206,10 +209,10 @@ __global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camer
     delete *d_camera;
 }
 
-int main() {
-    int nx = 800;
-    int ny = 400;
-    int ns = 20;
+int main(int argc, char** argv) {
+    int nx = 1920;
+    int ny = 1080;
+    int ns = 50;
     int tx = 32;
     int ty = 16;
 
@@ -237,14 +240,29 @@ int main() {
     checkCudaErrors(cudaDeviceSetLimit(cudaLimitStackSize, 32768));
     checkCudaErrors(cudaDeviceSetLimit(cudaLimitMallocHeapSize, 256*1024*1024));
 
+    bool scene_lucy = false;
+    if (argc > 1) {
+        std::string scene_arg = argv[1];
+        if (scene_arg == "lucy") {
+            scene_lucy = true;
+        } else if (scene_arg == "sphere") {
+            scene_lucy = false;
+        } else {
+            std::cerr << "Unknown scene arg '" << scene_arg << "'. Use 'sphere' or 'lucy'. Defaulting to sphere.\n";
+        }
+    }
+
     std::vector<vec3> tri_v0, tri_v1, tri_v2;
     vec3 lucy_bbox_min(0,0,0), lucy_bbox_max(0,0,0);
     const int lucy_triangle_stride = 1;
-    if (load_obj_triangles("lucy.obj", tri_v0, tri_v1, tri_v2, lucy_bbox_min, lucy_bbox_max, lucy_triangle_stride)) {
-        std::cerr << "Loaded lucy.obj with " << tri_v0.size() << " triangles after stride " << lucy_triangle_stride
-                  << ", instanced via 3 bbox-wrapped nodes.\n";
-    } else {
-        std::cerr << "lucy.obj not found or failed to parse, rendering spheres only.\n";
+    if (scene_lucy) {
+        if (load_obj_triangles("lucy.obj", tri_v0, tri_v1, tri_v2, lucy_bbox_min, lucy_bbox_max, lucy_triangle_stride)) {
+            std::cerr << "Loaded lucy.obj with " << tri_v0.size() << " triangles after stride " << lucy_triangle_stride
+                      << ", instanced via 3 bbox-wrapped nodes.\n";
+        } else {
+            std::cerr << "lucy.obj not found or failed to parse, rendering spheres only.\n";
+            scene_lucy = false;
+        }
     }
 
     int tri_count = (int)tri_v0.size();
@@ -260,13 +278,15 @@ int main() {
 
     // make our world of hitables & the camera
     hitable **d_list;
-    int num_hitables = 22*22+1 + ((tri_count > 0) ? 3 : 0);
+    int sphere_count = 22*22 + 1 + (scene_lucy ? 0 : 3);
+    int num_lucy_instances = (scene_lucy && tri_count > 0) ? 3 : 0;
+    int num_hitables = sphere_count + num_lucy_instances;
     checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables*sizeof(hitable *)));
     hitable **d_world;
     checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
     camera **d_camera;
     checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-    create_world<<<1,1>>>(d_list, d_world, d_camera, nx, ny, d_rand_state2, d_tri_v0, d_tri_v1, d_tri_v2, tri_count, lucy_bbox_min, lucy_bbox_max);
+    create_world<<<1,1>>>(d_list, d_world, d_camera, nx, ny, d_rand_state2, d_tri_v0, d_tri_v1, d_tri_v2, tri_count, lucy_bbox_min, lucy_bbox_max, scene_lucy? 1: 0);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
@@ -301,7 +321,7 @@ int main() {
 
     // clean up
     checkCudaErrors(cudaDeviceSynchronize());
-    free_world<<<1,1>>>(d_list,d_world,d_camera, 22*22+1, num_hitables);
+    free_world<<<1,1>>>(d_list,d_world,d_camera, sphere_count, num_hitables);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaFree(d_camera));
     checkCudaErrors(cudaFree(d_world));

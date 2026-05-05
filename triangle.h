@@ -6,8 +6,7 @@
 class triangle : public hitable {
 public:
     __device__ triangle() {}
-    __device__ triangle(const vec3& a, const vec3& b, const vec3& c, material *m)
-        : v0(a), v1(b), v2(c), mat_ptr(m) {}
+    __device__ triangle(const vec3& a, const vec3& b, const vec3& c, material *m): v0(a), v1(b), v2(c), mat_ptr(m) {}
 
     __device__ virtual bool hit(const ray& r, float t_min, float t_max, hit_record& rec) const;
     __device__ virtual bool bounding_box(float t0, float t1, aabb& output_box) const;
